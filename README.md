@@ -1,3 +1,25 @@
+# HDS Resonance Audio
+
+HDS Resonance Audio is a spatial audio rendering library maintained by Hollow Dream Studios. It is a fork of Google's Resonance Audio and provides binaural (HRTF) rendering, ambisonics, and shoebox room acoustics.
+
+The library is engine agnostic. It takes source audio buffers and a listener pose and returns a binaural stereo mix. It does not load files, own an audio device, or mix buses, so it sits underneath a host audio engine rather than replacing one.
+
+This fork stays close to upstream. The DSP and the public API in `resonance_audio/api/resonance_audio_api.h` are unchanged. Modifications are limited to what is needed to build the library on current toolchains, and they are listed in `MODIFICATIONS.md`.
+
+## Building the static library
+
+Fetch the third party dependencies, then configure and build:
+
+    ./third_party/clone_core_deps.sh
+    cmake -S . -B build -DBUILD_RESONANCE_AUDIO_API=ON -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+    cmake --build build --config Release
+
+The output is `ResonanceAudioStatic`. On Windows the build links the static runtime by default. The upstream documentation below covers the other platform targets, tests, and options.
+
+## Upstream documentation
+
+The original Resonance Audio README follows.
+
 # [Resonance Audio](https://developers.google.com/resonance-audio) Source Code [![Travis CI](https://travis-ci.org/resonance-audio/resonance-audio.svg?branch=master)](https://travis-ci.org/resonance-audio/resonance-audio)
 
 This is the official open source project for the Resonance Audio SDK. This
