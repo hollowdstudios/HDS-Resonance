@@ -187,6 +187,8 @@ set(RA_SOURCES
         ${RA_SOURCE_DIR}/node/subscriber_node.h
         ${PROJECT_SOURCE_DIR}/platforms/common/room_effects_utils.cc
         ${PROJECT_SOURCE_DIR}/platforms/common/room_effects_utils.h
+        ${PROJECT_SOURCE_DIR}/hdsr/acoustics.cc
+        ${PROJECT_SOURCE_DIR}/hdsr/acoustics.h
         ${RA_SOURCE_DIR}/utils/buffer_crossfader.cc
         ${RA_SOURCE_DIR}/utils/buffer_crossfader.h
         ${RA_SOURCE_DIR}/utils/buffer_partitioner.cc
