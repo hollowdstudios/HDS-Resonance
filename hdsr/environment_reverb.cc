@@ -24,21 +24,50 @@ const int kLines = 8;
 const int kMaxBlock = 4096;
 // Delay-line lengths in milliseconds - spread + mutually near-coprime for a dense, natural tail.
 const float kDelayMs[kLines] = {19.1f, 23.7f, 29.3f, 37.1f, 41.3f, 47.9f, 53.3f, 59.7f};
+// Maximum propagation pre-delay (ms). ~200 ms is ~68 m at the speed of sound; beyond that a distant
+// room is near the coupling cutoff anyway, and a longer pre-delay would read as a discrete echo.
+const float kMaxPreDelayMs = 200.0f;
 
 float Clampf(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }
+
+// Reduce a per-band coupling curve to what the FDN output stage needs: a broadband `level` (the
+// low-frequency coupling, which sets the tail loudness) plus a one-pole low-pass coefficient `lpA`
+// so the tail's high frequencies are attenuated to the coupling's high-to-low ratio. A flat curve
+// (equal in every band, e.g. the listener's own room at coupling 1) yields lpA = 0 -> no filtering,
+// so the scalar/flat path is unchanged. A darker-in-highs curve (a distant room through walls)
+// yields lpA > 0 -> the tail comes through muffled. A one-pole LP y=(1-a)x+a*y has unity DC gain
+// and (1-a)/(1+a) at Nyquist; solving for the wanted high/low ratio r gives a=(1-r)/(1+r).
+void CouplingLevelAndLp(const float coupling[kNumBands], float& level, float& lpA) {
+    float gLow = 0.0f;
+    for (int b = 0; b < 4; ++b) gLow += coupling[b]; // 31.25 .. 250 Hz
+    gLow *= 0.25f;
+    float gHigh = 0.0f;
+    for (int b = kNumBands - 3; b < kNumBands; ++b) gHigh += coupling[b]; // 2k .. 8k Hz
+    gHigh /= 3.0f;
+    level = Clampf(gLow, 0.0f, 1.0f);
+    const float r = level > 1e-5f ? Clampf(gHigh / level, 0.02f, 1.0f) : 1.0f;
+    lpA = Clampf((1.0f - r) / (1.0f + r), 0.0f, 0.96f);
+}
 } // namespace
 
 struct EnvironmentReverb::Impl {
     int sr = 0;
     int maxEnv = 0;
     int delayLen[kLines] = {0};
+    int preFrames = 0; // propagation pre-delay ring length in frames (max delay + 1)
 
     struct Slot {
         int id = -1;              // -1 = free
         bool declared = false;    // set this block (else ringing out)
         float gain = 1.0f;
-        float targetCoupling = 0.0f;
-        float coupling = 0.0f;    // smoothed coupling actually applied (fades when undeclared)
+        float targetCoupling = 0.0f; // target low-band coupling LEVEL this block
+        float coupling = 0.0f;    // smoothed coupling level actually applied (fades when undeclared)
+        float targetOutA = 0.0f;  // target output low-pass coeff (from the coupling spectrum tilt)
+        float outA = 0.0f;        // smoothed output low-pass coeff
+        float outLpL = 0.0f, outLpR = 0.0f; // per-channel output low-pass state (the muffling filter)
+        std::vector<float> preBuf; // propagation pre-delay ring, interleaved stereo (preFrames*2)
+        int preWrite = 0;          // pre-delay ring write cursor
+        int preDelaySamples = 0;   // current pre-delay in samples [0, preFrames-1]
         float energy = 0.0f;      // running tail energy estimate (to free silent slots)
         std::vector<std::vector<float>> delay; // [kLines][delayLen]
         int writePos[kLines] = {0};
@@ -57,6 +86,13 @@ struct EnvironmentReverb::Impl {
         }
         s.energy = 0.0f;
         s.coupling = 0.0f;
+        s.outA = 0.0f;
+        s.outLpL = 0.0f;
+        s.outLpR = 0.0f;
+        std::fill(s.preBuf.begin(), s.preBuf.end(), 0.0f);
+        s.preWrite = 0;
+        s.preDelaySamples = 0; // a freshly (re)admitted environment starts un-delayed until it is
+                               // set, so a re-used slot never inherits the previous room's pre-delay.
     }
 
     // Set an environment's per-line gains + damping from its RT60 curve.
@@ -81,6 +117,18 @@ struct EnvironmentReverb::Impl {
 
     // Get (or create) the slot for `id`. On overflow, evict the least-coupled slot iff the new
     // environment is more coupled; otherwise return null (this environment is dropped this block).
+    // Effective coupling used to RANK slots for eviction. A slot already declared THIS block uses
+    // its just-set target; an undeclared/ringing slot uses its smoothed level (which decays toward 0
+    // as it rings out). Ranking by the raw smoothed level alone is wrong during the per-block
+    // SetEnvironment sweep: a slot admitted earlier in the same block still reads coupling 0
+    // (ResetSlotState zeroes it; the smoothing that raises it runs later, in Process), so it would
+    // look like the weakest and a later declaration would evict it - dropping the MOST-coupled
+    // environment instead of the least. Using the target for declared slots fixes that.
+    static float EffectiveCoupling(const Slot& s) {
+        const float t = s.declared ? s.targetCoupling : 0.0f;
+        return s.coupling > t ? s.coupling : t;
+    }
+
     Slot* Acquire(int id, float coupling) {
         if (Slot* s = FindById(id)) return s;
         for (Slot& s : slots)
@@ -89,12 +137,17 @@ struct EnvironmentReverb::Impl {
                 ResetSlotState(s);
                 return &s;
             }
-        // Full: find the least-coupled slot (undeclared slots are fading, so rank by smoothed
-        // coupling - they are naturally the first to go).
+        // Full: evict the genuinely least-coupled slot, ranked by effective coupling this block.
         Slot* weakest = &slots[0];
-        for (Slot& s : slots)
-            if (s.coupling < weakest->coupling) weakest = &s;
-        if (coupling > weakest->coupling) {
+        float weakestKey = EffectiveCoupling(slots[0]);
+        for (Slot& s : slots) {
+            const float k = EffectiveCoupling(s);
+            if (k < weakestKey) {
+                weakest = &s;
+                weakestKey = k;
+            }
+        }
+        if (coupling > weakestKey) {
             weakest->id = id;
             ResetSlotState(*weakest);
             return weakest;
@@ -134,10 +187,29 @@ struct EnvironmentReverb::Impl {
                 wetL += y[i] * cL[i];
                 wetR += y[i] * cR[i];
             }
-            out[n_i * 2 + 0] += wetL * mix;
-            out[n_i * 2 + 1] += wetR * mix;
+            // Tail energy estimate is measured BEFORE the coupling filter (the raw ring), so a
+            // heavily-muffled distant room still frees its slot on the same schedule as any other.
             const float m = std::fabs(wetL) + std::fabs(wetR);
             if (m > peak) peak = m;
+            // Coupling low-pass: a distant room's tail reaches the listener darkened (highs lost to
+            // the intervening partitions). outA = 0 for a flat coupling -> passthrough (unchanged).
+            s.outLpL = (1.0f - s.outA) * wetL + s.outA * s.outLpL;
+            s.outLpR = (1.0f - s.outA) * wetR + s.outA * s.outLpR;
+            // Propagation pre-delay: the room's reverberant field takes distance/speed-of-sound to
+            // reach the listener. Always write the ring and read `preDelaySamples` back; at delay 0
+            // read == just-written, so the output is bit-identical to the no-pre-delay path.
+            float dL = s.outLpL, dR = s.outLpR;
+            if (preFrames > 0) {
+                s.preBuf[static_cast<size_t>(s.preWrite) * 2 + 0] = s.outLpL;
+                s.preBuf[static_cast<size_t>(s.preWrite) * 2 + 1] = s.outLpR;
+                int r = s.preWrite - s.preDelaySamples;
+                if (r < 0) r += preFrames;
+                dL = s.preBuf[static_cast<size_t>(r) * 2 + 0];
+                dR = s.preBuf[static_cast<size_t>(r) * 2 + 1];
+                s.preWrite = (s.preWrite + 1) % preFrames;
+            }
+            out[n_i * 2 + 0] += dL * mix;
+            out[n_i * 2 + 1] += dR * mix;
         }
         return peak;
     }
@@ -157,12 +229,20 @@ bool EnvironmentReverb::Init(int sampleRate, int maxEnvironments) {
         impl_->delayLen[i] = len;
         if (len > maxLen) maxLen = len;
     }
+    // Propagation pre-delay ring: max delay in samples + 1 (so read never collides with write).
+    impl_->preFrames = static_cast<int>(kMaxPreDelayMs * static_cast<float>(sampleRate) / 1000.0f) + 1;
     impl_->slots.clear();
     impl_->slots.resize(static_cast<size_t>(maxEnvironments));
     for (Impl::Slot& s : impl_->slots) {
         s.id = -1;
         s.declared = false;
         s.coupling = 0.0f;
+        s.outA = 0.0f;
+        s.outLpL = 0.0f;
+        s.outLpR = 0.0f;
+        s.preBuf.assign(static_cast<size_t>(impl_->preFrames) * 2, 0.0f);
+        s.preWrite = 0;
+        s.preDelaySamples = 0;
         s.energy = 0.0f;
         s.delay.assign(kLines, std::vector<float>());
         for (int i = 0; i < kLines; ++i)
@@ -195,11 +275,24 @@ void EnvironmentReverb::BeginBlock() {
 
 void EnvironmentReverb::SetEnvironment(int id, const float rt60[kNumBands], float coupling,
                                        float gain) {
-    if (id < 0 || !IsReady()) return;
-    Impl::Slot* s = impl_->Acquire(id, Clampf(coupling, 0.0f, 1.0f));
-    if (s == nullptr) return; // dropped by capacity (least coupled)
+    // The scalar case is a flat coupling curve (every band equal): forward it to the per-band path
+    // so there is one code path. A flat curve yields no low-pass, so this stays the original behavior.
+    const float c = Clampf(coupling, 0.0f, 1.0f);
+    float bands[kNumBands];
+    for (int b = 0; b < kNumBands; ++b) bands[b] = c;
+    SetEnvironment(id, rt60, bands, gain);
+}
+
+void EnvironmentReverb::SetEnvironment(int id, const float rt60[kNumBands],
+                                       const float coupling[kNumBands], float gain) {
+    if (id < 0 || coupling == nullptr || !IsReady()) return;
+    float level = 0.0f, lpA = 0.0f;
+    CouplingLevelAndLp(coupling, level, lpA);
+    Impl::Slot* s = impl_->Acquire(id, level); // capacity ranks by the broadband coupling level
+    if (s == nullptr) return;                  // dropped by capacity (least coupled)
     s->declared = true;
-    s->targetCoupling = Clampf(coupling, 0.0f, 1.0f);
+    s->targetCoupling = level;
+    s->targetOutA = lpA;
     s->gain = gain > 0.0f ? gain : 0.0f;
     impl_->Configure(*s, rt60);
 }
@@ -212,6 +305,16 @@ void EnvironmentReverb::AddInput(int id, const float* mono, int numSamples) {
     for (int i = 0; i < n; ++i) s->input[static_cast<size_t>(i)] += mono[i];
 }
 
+void EnvironmentReverb::SetEnvironmentPreDelay(int id, float seconds) {
+    if (!IsReady()) return;
+    Impl::Slot* s = impl_->FindById(id);
+    if (s == nullptr) return;
+    int samples = seconds > 0.0f ? static_cast<int>(seconds * static_cast<float>(impl_->sr)) : 0;
+    if (samples < 0) samples = 0;
+    if (samples > impl_->preFrames - 1) samples = impl_->preFrames - 1; // clamp to the ring
+    s->preDelaySamples = samples;
+}
+
 void EnvironmentReverb::Process(float* interleavedStereo, int numSamples) {
     if (interleavedStereo == nullptr || numSamples <= 0 || !IsReady()) return;
     const int n = numSamples < kMaxBlock ? numSamples : kMaxBlock;
@@ -222,6 +325,9 @@ void EnvironmentReverb::Process(float* interleavedStereo, int numSamples) {
         // declared, so its tail fades out of the mix rather than clicking).
         const float target = s.declared ? s.targetCoupling : 0.0f;
         s.coupling += (target - s.coupling) * 0.25f;
+        // Smooth the muffling low-pass coefficient too (a room's coupling spectrum shifts as doors
+        // open or the listener moves between rooms); hold the last value while undeclared (fading).
+        if (s.declared) s.outA += (s.targetOutA - s.outA) * 0.25f;
         const float mix = s.coupling * s.gain;
         const float peak = impl_->ProcessSlot(s, interleavedStereo, n, mix);
         // Track the raw tail energy (independent of coupling) so a silent, undeclared slot frees.
@@ -329,6 +435,104 @@ bool EnvironmentReverb::SelfTest() {
         for (int i = 0; i < block * 2; ++i)
             if (!(out[static_cast<size_t>(i)] == out[static_cast<size_t>(i)])) finite = false; // NaN check
         check(finite, "reverb output was non-finite");
+    }
+
+    // Eviction keeps the MOST-coupled, not the last-declared: into capacity 1, declare a strong room
+    // (0.9) first and a weak one (0.1) second; the weak room must be REJECTED (not admitted by
+    // displacing the strong one). Proof: feed the impulse ONLY into the weak room - if it was
+    // wrongly admitted its tail would ring; if correctly rejected, its input is dropped and the
+    // output stays silent. (This is the case the count-only capacity check above cannot catch.)
+    {
+        EnvironmentReverb rv;
+        rv.Init(sr, 1);
+        float rt[kNumBands];
+        for (int b = 0; b < kNumBands; ++b) rt[b] = 1.0f;
+        std::fill(impulse.begin(), impulse.end(), 0.0f);
+        impulse[0] = 1.0f;
+        float peakWeak = 0.0f;
+        for (int blk = 0; blk < 30; ++blk) {
+            rv.BeginBlock();
+            rv.SetEnvironment(20, rt, 0.9f, 1.0f); // strong, declared first
+            rv.SetEnvironment(21, rt, 0.1f, 1.0f); // weak, overflow -> must be rejected
+            if (blk == 0) rv.AddInput(21, impulse.data(), block); // feed the room that must be rejected
+            rv.Process(out.data(), block);
+            for (int i = 0; i < block * 2; ++i)
+                if (std::fabs(out[static_cast<size_t>(i)]) > peakWeak) peakWeak = std::fabs(out[static_cast<size_t>(i)]);
+        }
+        check(rv.ActiveEnvironmentCount() == 1, "capacity 1 should hold exactly 1 environment");
+        check(peakWeak < 1e-6f, "the least-coupled room must be rejected (not evict the most-coupled)");
+    }
+
+    // Per-band coupling muffles the tail: a coupling curve that is strong in the lows and weak in
+    // the highs produces a DARKER tail (less high-frequency content) than a flat coupling at the
+    // same low-band level. Brightness = first-difference energy / total energy (scale-invariant, so
+    // the level difference between the two curves does not affect the comparison).
+    {
+        auto brightness = [&](bool dark) -> float {
+            EnvironmentReverb rv;
+            rv.Init(sr, 4);
+            float rt[kNumBands];
+            for (int b = 0; b < kNumBands; ++b) rt[b] = 1.0f;
+            float coup[kNumBands];
+            for (int b = 0; b < kNumBands; ++b)
+                coup[b] = dark ? (0.8f - 0.09f * static_cast<float>(b)) : 0.8f; // dark: highs fall off
+            std::fill(impulse.begin(), impulse.end(), 0.0f);
+            impulse[0] = 1.0f;
+            double sumSq = 0.0, diffSq = 0.0;
+            float prev = 0.0f;
+            for (int blk = 0; blk < 60; ++blk) {
+                rv.BeginBlock();
+                rv.SetEnvironment(1, rt, coup, 1.0f);
+                if (blk == 0) rv.AddInput(1, impulse.data(), block);
+                rv.Process(out.data(), block);
+                for (int i = 0; i < block; ++i) {
+                    const float v = out[static_cast<size_t>(i) * 2]; // left channel
+                    sumSq += static_cast<double>(v) * v;
+                    const float d = v - prev;
+                    diffSq += static_cast<double>(d) * d;
+                    prev = v;
+                }
+            }
+            return sumSq > 1e-12 ? static_cast<float>(diffSq / sumSq) : 0.0f;
+        };
+        const float flatB = brightness(false);
+        const float darkB = brightness(true);
+        check(flatB > 1e-6f, "per-band reverb produced no output");
+        check(darkB < flatB * 0.9f, "a darker-in-highs coupling should reduce tail brightness");
+    }
+
+    // Propagation pre-delay shifts the tail onset by ~distance/speed-of-sound. The FDN sequence is
+    // identical between the two runs (the pre-delay is purely on the output path), so a 50 ms delay
+    // moves the first audible sample later by ~50 ms.
+    {
+        auto onsetSample = [&](float preSec) -> int {
+            EnvironmentReverb rv;
+            rv.Init(sr, 1);
+            float rt[kNumBands];
+            for (int b = 0; b < kNumBands; ++b) rt[b] = 1.0f;
+            std::fill(impulse.begin(), impulse.end(), 0.0f);
+            impulse[0] = 1.0f;
+            int idx = -1, sampleIdx = 0;
+            for (int blk = 0; blk < 40 && idx < 0; ++blk) {
+                rv.BeginBlock();
+                rv.SetEnvironment(1, rt, 1.0f, 1.0f);
+                rv.SetEnvironmentPreDelay(1, preSec);
+                if (blk == 0) rv.AddInput(1, impulse.data(), block);
+                rv.Process(out.data(), block);
+                for (int i = 0; i < block; ++i, ++sampleIdx) {
+                    const float m = std::fabs(out[static_cast<size_t>(i) * 2]) +
+                                    std::fabs(out[static_cast<size_t>(i) * 2 + 1]);
+                    if (m > 1e-5f) { idx = sampleIdx; break; }
+                }
+            }
+            return idx;
+        };
+        const int on0 = onsetSample(0.0f);
+        const int on50 = onsetSample(0.05f);
+        check(on0 >= 0 && on50 >= 0, "pre-delay onset not found");
+        const int expected = static_cast<int>(0.05f * static_cast<float>(sr));
+        check(std::abs((on50 - on0) - expected) < 200,
+              "pre-delay should shift the tail onset by ~distance/speed-of-sound");
     }
 
     return ok;

@@ -57,6 +57,25 @@ Engine-agnostic acoustic materials + room acoustics + propagation:
   (large rooms get a darker HF tail), from shoebox dimensions + per-face materials.
 - **Propagation** — `CombineTransmission(t[], n)` (total transmission through a sequence of
   surfaces), `PortalTransmission(closedMaterial, openness)` (a door/window opening).
+- **Frequency-dependent propagation** — `MaterialTransmissionBands` /
+  `PortalTransmissionBands` / `CombineTransmissionBands`: the per-octave-band counterparts of the
+  scalars above. A partition's transmission loss rises with frequency (mass law, ~6 dB/oct), so a
+  material's broadband transmission is tilted into a curve that anchors the mid band and passes lows
+  more than highs. This is what makes cross-room bleed *muffled*, not merely quieter.
+- **Room-to-room propagation graph** — `PropagationEdge` + `SolvePropagation(roomCount, edges,
+  edgeCount, listenerRoom, couplingOut)`: given rooms connected by portal/wall edges (each carrying
+  a per-band transmission **and a distance**), a max-product relaxation finds each room's per-band
+  coupling to the listener along the **best path** through the graph (A → B → listener when the
+  direct A → listener wall blocks more than two doorways in series). Each edge's contribution is its
+  transmission **times a distance attenuation** — an inverse-distance geometric rolloff beyond a
+  reference range plus per-band air absorption that darkens the highs over distance — so a farther
+  room couples less and darker, not just through thinner walls. Allocation-free, bounded.
+- **Diffraction** — `DiffractionPortal` + `DiffractedSourcePosition(src, listener,
+  directTransmission, portals, count, outPos)`: when the direct path to a source is occluded but an
+  opening offers a clearer route, the apparent source is pulled toward the best opening (so the sound
+  seems to come from the doorway, not through the wall). The host supplies the portals + per-leg
+  transmissions from its own geometry queries; the library owns the decision. Position-only, so a
+  wrong guess never silences a voice.
 - **`ReflectionCoefficient(material)`**, **`SelfTest()`** (headless library test).
 
 Consumers translate their own materials → `hdsr::AcousticMaterial`, call these, and translate the
@@ -86,20 +105,43 @@ eviction. (Heartbreak: `AcousticWorld` declares every coupled `AcousticSpace` as
 coupling = transmission from the room to the listener through portals; each spatial voice is routed
 into its room; the tails mix into the binaural output inside the spatializer node.)
 
+`coupling` is **per-band**: `SetEnvironment` has an overload taking a 9-band coupling curve (from
+`SolvePropagation`). The environment's tail is mixed at the low-band coupling level *and* low-pass
+filtered by the curve's high-to-low ratio, so a distant room reached through walls bleeds in
+**darkened** (muffled), not merely quieter. A flat curve (the scalar overload) is the "just quieter"
+special case — it applies no filtering, so the pre-existing scalar path is unchanged. `SelfTest()`
+also checks that a darker-in-highs coupling reduces the tail's high-frequency content.
+
+Each environment also has a **propagation pre-delay** (`SetEnvironmentPreDelay(id, seconds)`): its
+reverb tail is delayed by `distance / speed-of-sound` before it mixes in, because the room's
+reverberant field takes time to reach the listener. The listener's own room is ~0; a distant room's
+tail arrives audibly later. It is a per-environment output delay line (the diffuse tail tolerates an
+integer delay that changes as the listener moves); `0` is bit-identical to no pre-delay. `SelfTest()`
+checks the tail onset shifts by the set delay.
+
 ## Roadmap (the general-purpose feature set)
 
 Implemented in `hdsr` now: acoustic materials, frequency-dependent absorption, scattering,
 transmission, reflection coefficients, shoebox room acoustics, RT60, air absorption, occlusion
-transmission, basic propagation, portal openings, and **multi-environment reverb** (each active
-room contributes its own coupling-weighted reverb tail, mixed up to an explicit capacity).
+transmission, basic propagation, portal openings, **multi-environment reverb** (each active room
+contributes its own coupling-weighted reverb tail, mixed up to an explicit capacity),
+**frequency-dependent transmission** (mass-law-tilted per-band transmission through
+materials/portals → muffled cross-room bleed), a **room-to-room propagation graph**
+(`SolvePropagation` best-path per-band coupling), and **per-band environment coupling** (a distant
+room's tail is darkened, not just quieter).
+
+Also implemented: **diffraction** (`DiffractedSourcePosition` — apparent-source repositioning toward
+the clearest opening when the direct path is occluded; the model now lives here, Heartbreak only
+supplies the portal geometry + transmissions).
 
 Planned (engine-agnostic, geometry/query results supplied by the engine):
 
-- **Diffraction** — apparent-source repositioning toward openings, given portal + occlusion data
-  (Heartbreak currently prototypes this engine-side; the *model* belongs here).
-- **Multi-environment refinement** — the reverb bank exists (`environment_reverb.h`); remaining is
-  richer coupling (frequency-dependent portal transmission, room→room propagation graph vs. the
-  current room→listener transmission), reverb-tail EQ, and audible tuning.
+- **Multi-environment refinement** — done: the reverb bank, per-band coupling, the room→room
+  propagation graph, **distance/decay along edges** (geometric rolloff + per-band air absorption over
+  distance), and a **propagation pre-delay** (each room's tail arrives after `distance / c`) all
+  exist. The graph is undirected because acoustic coupling is reciprocal. Remaining: reverb-tail EQ
+  beyond the one-pole coupling filter, and audible tuning of the reference-distance / air-absorption /
+  pre-delay constants against a real device.
 - **Geometry-based acoustic queries** — image-source early reflections, ray-traced occlusion/
   propagation over an engine-provided triangle/BVH interface (the engine supplies hits; `hdsr`
   supplies the model).
@@ -111,8 +153,8 @@ Planned (engine-agnostic, geometry/query results supplied by the engine):
 
 ## Build
 
-`hdsr/acoustics.{h,cc}` compiles into `ResonanceAudioObj` → `ResonanceAudioStatic` (see
-`resonance_audio/CMakeLists.txt` `RA_SOURCES`). The fork root is on the include path
-(`CMakeLists.txt` `include_directories(${PROJECT_SOURCE_DIR})`), so consumers include
-`"hdsr/acoustics.h"`. No new dependencies. Verified via Heartbreak's `--test-acoustics`
-(runs `hdsr::SelfTest`).
+`hdsr/acoustics.{h,cc}` and `hdsr/environment_reverb.{h,cc}` compile into `ResonanceAudioObj` →
+`ResonanceAudioStatic` (see `resonance_audio/CMakeLists.txt` `RA_SOURCES`). The fork root is on the
+include path (`CMakeLists.txt` `include_directories(${PROJECT_SOURCE_DIR})`), so consumers include
+`"hdsr/acoustics.h"` / `"hdsr/environment_reverb.h"`. No new dependencies. Verified via Heartbreak's
+`--test-acoustics` (runs `hdsr::SelfTest` + `hdsr::EnvironmentReverb::SelfTest`).

@@ -58,6 +58,24 @@ public:
     // (continuous). If the capacity is exceeded, the least-coupled environment is dropped.
     void SetEnvironment(int id, const float rt60[kNumBands], float coupling, float gain);
 
+    // Per-band coupling overload: `coupling[b]` in [0,1] is the fraction of this environment's tail
+    // reaching the listener in octave band b (from the room-to-room propagation graph - see
+    // hdsr::SolvePropagation). The tail is mixed at the low-band coupling level AND low-pass filtered
+    // by the coupling spectrum's high-to-low ratio, so a distant room bleeds through DARKENED
+    // (muffled), not merely quieter. The scalar overload above is the flat special case (all bands
+    // equal -> no filtering). Same capacity/continuity rules.
+    void SetEnvironment(int id, const float rt60[kNumBands], const float coupling[kNumBands],
+                        float gain);
+
+    // Sets environment `id`'s propagation PRE-DELAY: the number of seconds its reverb tail is
+    // delayed before it mixes into the listener's output, because the room's reverberant field takes
+    // time to travel to the listener (distance / speed-of-sound). The listener's own room is ~0; a
+    // distant room's tail arrives audibly later. Call after SetEnvironment (no-op for an id not
+    // declared / admitted this block). Clamped to an internal maximum (~200 ms); 0 = no delay (the
+    // output is then bit-identical to the no-pre-delay path). The tail is diffuse, so the integer
+    // delay length may change block to block (listener moving) without audible artifacts.
+    void SetEnvironmentPreDelay(int id, float seconds);
+
     // Adds a source's mono audio into environment `id`'s reverb input for this block (sources in
     // the same environment sum). Ignored for ids not declared this block or already evicted.
     void AddInput(int id, const float* mono, int numSamples);
