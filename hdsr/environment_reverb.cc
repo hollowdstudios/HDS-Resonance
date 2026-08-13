@@ -65,6 +65,8 @@ struct EnvironmentReverb::Impl {
         float targetOutA = 0.0f;  // target output low-pass coeff (from the coupling spectrum tilt)
         float outA = 0.0f;        // smoothed output low-pass coeff
         float outLpL = 0.0f, outLpR = 0.0f; // per-channel output low-pass state (the muffling filter)
+        float targetPan = 0.0f;    // where the reverb arrives from, [-1,+1] (-L,+R)
+        float pan = 0.0f;          // smoothed pan actually applied
         std::vector<float> preBuf; // propagation pre-delay ring, interleaved stereo (preFrames*2)
         int preWrite = 0;          // pre-delay ring write cursor
         int preDelaySamples = 0;   // current pre-delay in samples [0, preFrames-1]
@@ -89,6 +91,7 @@ struct EnvironmentReverb::Impl {
         s.outA = 0.0f;
         s.outLpL = 0.0f;
         s.outLpR = 0.0f;
+        s.pan = 0.0f;
         std::fill(s.preBuf.begin(), s.preBuf.end(), 0.0f);
         s.preWrite = 0;
         s.preDelaySamples = 0; // a freshly (re)admitted environment starts un-delayed until it is
@@ -159,6 +162,10 @@ struct EnvironmentReverb::Impl {
     // `mix`. Returns the block's peak wet magnitude (for the energy estimate).
     float ProcessSlot(Slot& s, float* out, int n, float mix) {
         const float invN2 = 2.0f / static_cast<float>(kLines);
+        // Gentle directional pan bias (keeps the tail's stereo width): a room panned right (+) drops
+        // the left channel a little, and vice versa. pan 0 -> panL == panR == 1 (no change).
+        const float panL = 1.0f - 0.5f * (s.pan > 0.0f ? s.pan : 0.0f);
+        const float panR = 1.0f - 0.5f * (s.pan < 0.0f ? -s.pan : 0.0f);
         // Decorrelated stereo output taps.
         float cL[kLines], cR[kLines];
         for (int i = 0; i < kLines; ++i) {
@@ -208,8 +215,10 @@ struct EnvironmentReverb::Impl {
                 dR = s.preBuf[static_cast<size_t>(r) * 2 + 1];
                 s.preWrite = (s.preWrite + 1) % preFrames;
             }
-            out[n_i * 2 + 0] += dL * mix;
-            out[n_i * 2 + 1] += dR * mix;
+            // Directional bias: lean the tail toward the side the room is on (a gentle pan, so the
+            // reverb keeps its width but arrives from the doorway's direction). pan 0 = unchanged.
+            out[n_i * 2 + 0] += dL * mix * panL;
+            out[n_i * 2 + 1] += dR * mix * panR;
         }
         return peak;
     }
@@ -305,6 +314,13 @@ void EnvironmentReverb::AddInput(int id, const float* mono, int numSamples) {
     for (int i = 0; i < n; ++i) s->input[static_cast<size_t>(i)] += mono[i];
 }
 
+void EnvironmentReverb::SetEnvironmentPan(int id, float pan) {
+    if (!IsReady()) return;
+    Impl::Slot* s = impl_->FindById(id);
+    if (s == nullptr) return;
+    s->targetPan = Clampf(pan, -1.0f, 1.0f);
+}
+
 void EnvironmentReverb::SetEnvironmentPreDelay(int id, float seconds) {
     if (!IsReady()) return;
     Impl::Slot* s = impl_->FindById(id);
@@ -328,6 +344,8 @@ void EnvironmentReverb::Process(float* interleavedStereo, int numSamples) {
         // Smooth the muffling low-pass coefficient too (a room's coupling spectrum shifts as doors
         // open or the listener moves between rooms); hold the last value while undeclared (fading).
         if (s.declared) s.outA += (s.targetOutA - s.outA) * 0.25f;
+        // Smooth the directional pan toward the target as the listener turns (declared only).
+        if (s.declared) s.pan += (s.targetPan - s.pan) * 0.25f;
         const float mix = s.coupling * s.gain;
         const float peak = impl_->ProcessSlot(s, interleavedStereo, n, mix);
         // Track the raw tail energy (independent of coupling) so a silent, undeclared slot frees.

@@ -67,6 +67,13 @@ public:
     void SetEnvironment(int id, const float rt60[kNumBands], const float coupling[kNumBands],
                         float gain);
 
+    // Sets environment `id`'s stereo PAN in [-1, +1] (-1 = full left, 0 = centred/diffuse, +1 =
+    // full right): the direction its reverb arrives from, so a room reached through a doorway off to
+    // one side bleeds in from THAT side instead of sounding centred/mono. The listener's own room
+    // should stay 0 (its reverb surrounds them). It is a gentle bias (the tail keeps its stereo
+    // width), smoothed as the listener turns. Call after SetEnvironment (no-op for an unadmitted id).
+    void SetEnvironmentPan(int id, float pan);
+
     // Sets environment `id`'s propagation PRE-DELAY: the number of seconds its reverb tail is
     // delayed before it mixes into the listener's output, because the room's reverberant field takes
     // time to travel to the listener (distance / speed-of-sound). The listener's own room is ~0; a
