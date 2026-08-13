@@ -553,6 +553,38 @@ bool EnvironmentReverb::SelfTest() {
               "pre-delay should shift the tail onset by ~distance/speed-of-sound");
     }
 
+    // Directional pan: a fully-right-panned environment biases the tail toward the right channel
+    // (so a room off to one side is heard from that side, not centred). pan 0 stays balanced.
+    {
+        auto lrEnergy = [&](float pan, double& sumL, double& sumR) {
+            EnvironmentReverb rv;
+            rv.Init(sr, 2);
+            float rt[kNumBands];
+            for (int b = 0; b < kNumBands; ++b) rt[b] = 1.0f;
+            std::fill(impulse.begin(), impulse.end(), 0.0f);
+            impulse[0] = 1.0f;
+            sumL = 0.0;
+            sumR = 0.0;
+            for (int blk = 0; blk < 40; ++blk) {
+                rv.BeginBlock();
+                rv.SetEnvironment(1, rt, 1.0f, 1.0f);
+                rv.SetEnvironmentPan(1, pan);
+                if (blk == 0) rv.AddInput(1, impulse.data(), block);
+                rv.Process(out.data(), block);
+                for (int i = 0; i < block; ++i) {
+                    sumL += std::fabs(out[static_cast<size_t>(i) * 2]);
+                    sumR += std::fabs(out[static_cast<size_t>(i) * 2 + 1]);
+                }
+            }
+        };
+        double rL = 0.0, rR = 0.0, cL2 = 0.0, cR2 = 0.0;
+        lrEnergy(1.0f, rL, rR);   // full right
+        lrEnergy(0.0f, cL2, cR2); // centred
+        check(rR > rL * 1.2, "a right-panned environment should bias the tail to the right");
+        check(cL2 > 1e-9 && std::fabs(cL2 - cR2) < cL2 * 0.5,
+              "a centred (pan 0) environment should stay roughly balanced");
+    }
+
     return ok;
 }
 
