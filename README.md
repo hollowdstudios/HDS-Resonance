@@ -1,10 +1,20 @@
 # HDS Resonance Audio
 
-HDS Resonance Audio is a spatial audio rendering library maintained by Hollow Dream Studios. It is a fork of Google's Resonance Audio and provides binaural (HRTF) rendering, ambisonics, and shoebox room acoustics.
+HDS Resonance Audio is an engine-agnostic spatial-audio and game-acoustics library maintained by Hollow Dream Studios. It builds on Google's archived Resonance Audio renderer and adds a modern acoustics **model** layer on top, so a game engine gets not just binaural rendering but the physically-informed acoustics that make a scene sound like a *place*.
 
-The library is engine agnostic. It takes source audio buffers and a listener pose and returns a binaural stereo mix. It does not load files, own an audio device, or mix buses, so it sits underneath a host audio engine rather than replacing one.
+The library is engine agnostic throughout. It takes source audio buffers, a listener pose, and host-supplied geometry/ray-query results, and returns a binaural stereo mix. It does not load files, own an audio device, or mix buses, so it sits underneath a host audio engine rather than replacing one.
 
-This fork stays close to upstream. The DSP and the public API in `resonance_audio/api/resonance_audio_api.h` are unchanged. Modifications are limited to what is needed to build the library on current toolchains, and they are listed in `MODIFICATIONS.md`.
+## Two layers
+
+- **The renderer (`vraudio`, upstream).** Binaural (HRTF) rendering, ambisonics, a per-source spatializer, and a shoebox room model. Kept close to upstream — the DSP and the public API in `resonance_audio/api/resonance_audio_api.h` are unchanged. Build fixes and the exact deltas are listed in `MODIFICATIONS.md`.
+- **The acoustics model (`hdsr`, added by this fork).** A standalone layer of game-acoustics primitives with no engine, physics, or file-format dependency: the host supplies geometry and ray-query *results*, and this layer turns them into the parameters that drive the renderer. It adds what the stock renderer lacks:
+  - **Frequency-dependent materials** — per-octave-band absorption, scattering, and *transmission* (energy passing through a surface, the basis of occlusion and cross-room bleed).
+  - **Room acoustics** — shoebox early-reflection coefficients and Eyring RT60 with air absorption.
+  - **Propagation** — per-band transmission through surfaces and portal openings, plus a **room-to-room propagation graph** that finds each room's best-path, per-band coupling to the listener, with distance rolloff and air absorption along the path.
+  - **Multi-environment reverb** — several rooms reverberate at once, each contributing its own tail, mixed by coupling and **darkened, delayed, and panned** by distance and direction, so a distant room bleeds in muffled, late, and from the doorway's side rather than centred.
+  - **Diffraction** — a source whose direct path is blocked is re-heard from the clearest opening.
+
+  C++11, POD types, no hot-path allocation. The full API and design are in [`docs/AcousticsLibrary.md`](docs/AcousticsLibrary.md).
 
 ## Building the static library
 

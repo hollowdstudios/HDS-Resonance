@@ -1,10 +1,12 @@
 # HDS-Resonance — game acoustics/audio library
 
-Status: **foundation started (2026-08-13).** HDS-Resonance is being developed as a **standalone,
-engine-agnostic, open-source game audio/acoustics library** — comparable in spirit to a general
-audio-acoustics middleware — with game engines as *clients*. It builds on the archived Google
-Resonance Audio renderer (`vraudio`, Apache-2.0) and adds a modern acoustic **model** layer
-(`hdsr`) on top.
+HDS-Resonance is a **standalone, engine-agnostic, open-source game audio/acoustics library** —
+comparable in spirit to a general audio-acoustics middleware — with game engines as *clients*. It
+builds on the archived Google Resonance Audio renderer (`vraudio`, Apache-2.0) and adds a modern
+acoustic **model** layer (`hdsr`) on top. The model layer is implemented and headless-tested:
+materials and frequency-dependent transmission, shoebox room acoustics, a room-to-room propagation
+graph, multi-environment reverb (with per-band coupling, distance decay, pre-delay, and directional
+pan), and diffraction.
 
 Heartbreak Engine is the **first and deepest** integration target, but it is a *consumer*, not the
 architect: the library API is designed for general games/engines, not around any one engine's
@@ -119,6 +121,13 @@ tail arrives audibly later. It is a per-environment output delay line (the diffu
 integer delay that changes as the listener moves); `0` is bit-identical to no pre-delay. `SelfTest()`
 checks the tail onset shifts by the set delay.
 
+Finally, each environment has a **stereo pan** (`SetEnvironmentPan(id, pan)`, −1…+1): the direction
+its reverb arrives from. A room reached through a doorway off to one side bleeds in from *that* side
+instead of sounding centred, so the reverb — not just the direct sound — helps localize the opening.
+The listener's own room stays centred (0). It is a gentle bias (the tail keeps its stereo width),
+smoothed as the listener turns. `SelfTest()` checks that a right-panned environment leans right and a
+centred one stays balanced.
+
 ## Roadmap (the general-purpose feature set)
 
 Implemented in `hdsr` now: acoustic materials, frequency-dependent absorption, scattering,
@@ -138,10 +147,10 @@ Planned (engine-agnostic, geometry/query results supplied by the engine):
 
 - **Multi-environment refinement** — done: the reverb bank, per-band coupling, the room→room
   propagation graph, **distance/decay along edges** (geometric rolloff + per-band air absorption over
-  distance), and a **propagation pre-delay** (each room's tail arrives after `distance / c`) all
-  exist. The graph is undirected because acoustic coupling is reciprocal. Remaining: reverb-tail EQ
-  beyond the one-pole coupling filter, and audible tuning of the reference-distance / air-absorption /
-  pre-delay constants against a real device.
+  distance), a **propagation pre-delay** (each room's tail arrives after `distance / c`), and a
+  **directional pan** (each room's tail arrives from its own side) all exist. The graph is undirected
+  because acoustic coupling is reciprocal. Remaining: reverb-tail EQ beyond the one-pole coupling
+  filter, and audible tuning of the reference-distance / air-absorption / pre-delay constants.
 - **Geometry-based acoustic queries** — image-source early reflections, ray-traced occlusion/
   propagation over an engine-provided triangle/BVH interface (the engine supplies hits; `hdsr`
   supplies the model).
