@@ -64,19 +64,42 @@ results into the renderer's room/source parameters. (Heartbreak: `.hbmat` acoust
 `hdsr::AcousticMaterial`; `AcousticSpace`/`AcousticPortal` components → `ComputeRoomAcoustics` /
 `PortalTransmission`; Jolt multi-hit rays → material transmissions → `CombineTransmission`.)
 
+## `hdsr/environment_reverb.h` — multi-environment reverb (implemented)
+
+`EnvironmentReverb` — a stereo reverberator that runs **several acoustic environments at once**.
+Each active environment (a room) has its own RT60 and contributes its **own** reverb tail, scaled
+by how acoustically **coupled** it is to the listener (portal/propagation coupling supplied by the
+host). The library **manages the set of environments** and **mixes ALL of them up to an explicit
+capacity** — this is a performance cap, not a "pick the loudest room" selection; when over capacity
+the *least-coupled* environment is dropped. Each environment persists its tail across blocks, so a
+source in the next room keeps ringing there after it stops and leaks to the listener through the
+coupling.
+
+DSP: a per-environment feedback-delay network (8 delay lines, orthogonal Householder feedback,
+per-line gain from RT60, per-line damping from the high-frequency RT60). Orthogonal + gain < 1 ⇒
+unconditionally stable regardless of RT60s or environment count. Usage per audio block:
+`BeginBlock()` → `SetEnvironment(id, rt60, coupling, gain)` per active room → `AddInput(id, mono, n)`
+per source (routed into the room it occupies) → `Process(stereoOut, n)`. The host supplies **only**
+room topology + coupling + source/listener state; the library owns the environments, the mixing,
+and the reverb DSP. `SelfTest()` verifies impulse decay ≈ RT60, coupling scaling, and capacity
+eviction. (Heartbreak: `AcousticWorld` declares every coupled `AcousticSpace` as an environment,
+coupling = transmission from the room to the listener through portals; each spatial voice is routed
+into its room; the tails mix into the binaural output inside the spatializer node.)
+
 ## Roadmap (the general-purpose feature set)
 
 Implemented in `hdsr` now: acoustic materials, frequency-dependent absorption, scattering,
 transmission, reflection coefficients, shoebox room acoustics, RT60, air absorption, occlusion
-transmission, basic propagation, portal openings.
+transmission, basic propagation, portal openings, and **multi-environment reverb** (each active
+room contributes its own coupling-weighted reverb tail, mixed up to an explicit capacity).
 
 Planned (engine-agnostic, geometry/query results supplied by the engine):
 
 - **Diffraction** — apparent-source repositioning toward openings, given portal + occlusion data
   (Heartbreak currently prototypes this engine-side; the *model* belongs here).
-- **Portals/zones & multi-environment** — a room/portal graph + per-environment reverb so a
-  source's *own* room tail is audible through a portal ("distant gunshot rings next door"). Likely
-  a renderer-DSP extension for multiple concurrent reverb environments.
+- **Multi-environment refinement** — the reverb bank exists (`environment_reverb.h`); remaining is
+  richer coupling (frequency-dependent portal transmission, room→room propagation graph vs. the
+  current room→listener transmission), reverb-tail EQ, and audible tuning.
 - **Geometry-based acoustic queries** — image-source early reflections, ray-traced occlusion/
   propagation over an engine-provided triangle/BVH interface (the engine supplies hits; `hdsr`
   supplies the model).
